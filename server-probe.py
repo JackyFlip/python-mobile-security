@@ -1,8 +1,9 @@
-import socket
+import socket 
+import threading
+import random 
 from enum import Enum
 import bcrypt
 import json
-import threading
 from Crypto.Cipher import AES
 from bitstring import BitArray
 import pickle
@@ -38,17 +39,18 @@ MESSAGES = {
 KEY_SIZE = 128 # Ki key size
 
 KI = '11101110000101010000001000101110111000010010110010011100101000000011111100110011110101010111010001100110010010010101111010111010'
+CHALLENGE = bin(random.getrandbits(KEY_SIZE))[2:].zfill(KEY_SIZE)
 
 
 # save credentials to file
 def save_credentials(credentials):
-    with open('client-credentials.json', 'w') as file:
+    with open('server-credentials.json', 'w') as file:
         json.dump(credentials, file)
 
 
 # load credentials
 def load_credentials():
-    with open('client-credentials.json', 'r') as file:
+    with open('server-credentials.json', 'r') as file:
         credentials = json.load(file)
     return credentials
 
@@ -76,59 +78,13 @@ def resolve_challenge(key, challenge):
     return bin(as1)[2:].zfill(int(KEY_SIZE/4))
 
 
-# prepare message to send
-def message_forming(msg_content, msg_type):
-    msg_header = f'{msg_type}'.zfill(HEADER_PART)+f'{len(msg_content)}'.zfill(HEADER_PART)
-    data = {
-        'header': msg_header,
-        'content': msg_content
-    }
-    p_data = pickle.dumps(data)
-    p_data += b'0'*(PACKET_SIZE - len(p_data))
-    return p_data
-
-
-# extract data out of a received message
-def message_peeling(msg):
-    print('\n[INFO] Message received!')
-    print(f'[EXTRACT] Extracting data out of the packet of size {len(msg)}')
-    data = pickle.loads(msg)
-    msg_header = data['header']
-    msg_content = data['content']
-    msg_length = int(msg_header[HEADER_PART:])
-    msg_type = msg_header[:HEADER_PART].lstrip('0')
-    return (msg_type, msg_length, msg_content)
-
-
-# send message to server
-def send_message(client, msg_content, msg_type):
-    client.send(message_forming(msg_content, msg_type))
-
-
-# key derivation
-def derivate_key():
-    print('\n[KEY] Key derivation...')
-    kc = bcrypt.kdf(password=KI.encode(),salt=load_credentials()['Rand'].encode(),desired_key_bytes=int(KEY_SIZE/8),rounds=128)
-    update_credentials('Kc', bin(int(kc.hex(), 16))[2:].zfill(KEY_SIZE))
-
-
-# manage key derivation and time of availability
-def key_management():
-    derivate_key()
-    return RepeatTimer(KEY_AVAILABILITY, derivate_key)
-
-
 # aes decryption
 def aes_management_decrypt(msg):
     data = pickle.loads(msg)
     kc = load_credentials()['Kc']
 
     cipher = AES.new(key=BitArray(bin=kc).bytes, mode=AES.MODE_EAX, nonce=data['nonce'])
-    encrypted_message = data['text']
-    decrypted_message = cipher.decrypt(encrypted_message).decode()
-    print(f'\n[MSG] Encrypted message : {encrypted_message}')
-
-    return decrypted_message
+    return cipher.decrypt(data['text']).decode()
 
 
 # aes encryption
@@ -144,46 +100,129 @@ def aes_management_encrypt(msg):
     return pickle.dumps(data)
 
 
-# client initialisation
+# server initialisation
 def init():
     credentials = {
         'Ki': KI,
+        'Rand': CHALLENGE
         }
 
     save_credentials(credentials)
 
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.connect(ADDRESS)
-    client.settimeout(10)
-    return client
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(ADDRESS)
+    server.settimeout(2)
+    return server
 
 
-# connect to server and process to authentification and send some messages
-def main():
-    print('[INIT] Client initialisation...')
-    client = init()
-    print('[CONNECTION] Client connected to server...')
+# prepare message to send
+def message_forming(msg_content, msg_type):
+    msg_header = f'{msg_type}'.zfill(HEADER_PART)+f'{len(msg_content)}'.zfill(HEADER_PART)
+    data = {
+        'header': msg_header,
+        'content': msg_content
+    }
+    p_data = pickle.dumps(data)
+    p_data += b'0'*(PACKET_SIZE - len(p_data))
+    return p_data
 
-    msg_type, _, msg_content = message_peeling(client.recv(PACKET_SIZE))
-    if msg_type==MessageType.CHALLENGE.value:
-        print('\n[AUTHENTICATION] Challenge received')
-        challenge = msg_content
-        update_credentials('Rand', challenge)
-        print('[AUTHENTICATION] Sending SRES')
-        send_message(client, resolve_challenge(KI, challenge), MessageType.SRES.value)
-        key_thread = key_management()
 
-    print('\n[AES] Sending AES encrypted message...')
-    send_message(client, aes_management_encrypt(MESSAGES['AES']), MessageType.AES.value)
-    msg_server = client.recv(PACKET_SIZE)
-    msg_type, msg_length, msg_content = message_peeling(msg_server)
-    print(f'[MSG] Message of length {msg_length} received: {aes_management_decrypt(msg_content)}')
+# extract data out of a received message
+def message_peeling(msg):
+    print(f'[EXTRACT] Extracting data out of the packet of size {len(msg)}')
+    data = pickle.loads(msg)
+    msg_header = data['header']
+    msg_content = data['content']
+    msg_length = int(msg_header[HEADER_PART:])
+    msg_type = msg_header[:HEADER_PART].lstrip('0')
+    return (msg_type, msg_length, msg_content)
 
-    send_message(client, 'See you!', MessageType.DISCONNECT.value)
-    print('\n[QUIT] Client quitting...')
+
+# check if the rand challenge is validated
+def compare_sres(sres, challenge):
+    return sres==resolve_challenge(KI, challenge)
+
+
+# process to authentidication
+def authenticate(connection):
+    authentified = False
+    challenge = load_credentials()['Rand']
+    while not authentified:
+        message = message_forming(challenge, MessageType.CHALLENGE.value)
+        connection.send(message)
+        msg_client = connection.recv(PACKET_SIZE)
+        if(msg_client):
+            msg_type, _, msg_content = message_peeling(msg_client)
+            if msg_type == MessageType.SRES.value:
+                authentified = compare_sres(msg_content, challenge)
+            else: 
+                connection.close()
+                break
+        print(f'Authentification: {authentified}')
+        
+
+# check if message is sent by the server
+def check_for_new_message(connection):
+    while True:
+        msg_client = connection.recv(PACKET_SIZE)
+        msg_type, msg_length, msg_content = message_peeling(msg_client)
+        if msg_type == MessageType.DISCONNECT.value:
+            print(f'[MSG] Message of length {msg_length} received: {msg_content}')
+            print('[RELEASING] Closing connection...')
+            connection.close()
+            break
+        if msg_type == MessageType.AES.value:
+            msg_decrypted = aes_management_decrypt(msg_content)
+            print(f'[MSG] Message of length {msg_length} received: {msg_decrypted}')
+            print('[AES] Sending AES encrypted message...')
+            connection.send(message_forming(aes_management_encrypt(MESSAGES['AES']), MessageType.AES.value))
+    print('[SHUTDOWN] Server shutdown...')
+
+
+# key derivation
+def derivate_key():
+    print('[KEY] Key derivation...')
+    kc = bcrypt.kdf(password=KI.encode(),salt=load_credentials()['Rand'].encode(),desired_key_bytes=int(KEY_SIZE/8),rounds=128)
+    update_credentials('Kc', bin(int(kc.hex(), 16))[2:].zfill(KEY_SIZE))
+
+
+# manage key derivation and time of availability
+def key_management():
+    derivate_key()
+    return RepeatTimer(KEY_AVAILABILITY, derivate_key)
+
+
+# manage client connection
+def client_handler(connection, address):
+    print(f'[CONNECTION] Client {address} connected...')
+    authenticate(connection)
+    key_thread = key_management()
+    key_thread.start()
+    check_for_new_message(connection)
     key_thread.cancel()
+
+    
+# start server
+def start(server):
+    server.listen()
+    print(f'[LISTENING] Server is listening on {SERVER}...')
+
+    try:
+        # while True:   #to use for multiple client connections
+        connection, address = server.accept()
+        thread = threading.Thread(target=client_handler, args=(connection, address))
+        thread.start()
+    except KeyboardInterrupt:
+        print('[SHUTDOWN] Server shutdown...')
+
+
+# initialise and start server
+def main():
+    print('[INIT] Server initialisation...')
+    server = init()
+    print('[START] Server starting...')
+    start(server)
 
 
 if __name__ == '__main__':
     main()
-
