@@ -84,7 +84,10 @@ def aes_management_decrypt(msg):
     kc = load_credentials()['Kc']
 
     cipher = AES.new(key=BitArray(bin=kc).bytes, mode=AES.MODE_EAX, nonce=data['nonce'])
-    return cipher.decrypt(data['text']).decode()
+    encrypted_message = data['text']
+    decrypted_message = cipher.decrypt(encrypted_message).decode()
+    print(f'[MSG] Encrypted message : {encrypted_message}')
+    return decrypted_message
 
 
 # aes encryption
@@ -129,6 +132,7 @@ def message_forming(msg_content, msg_type):
 
 # extract data out of a received message
 def message_peeling(msg):
+    print('\n[INFO] Message received!')
     print(f'[EXTRACT] Extracting data out of the packet of size {len(msg)}')
     data = pickle.loads(msg)
     msg_header = data['header']
@@ -149,6 +153,7 @@ def authenticate(connection):
     challenge = load_credentials()['Rand']
     while not authentified:
         message = message_forming(challenge, MessageType.CHALLENGE.value)
+        print('\n[AUTHENTICATION] Sending challenge...')
         connection.send(message)
         msg_client = connection.recv(PACKET_SIZE)
         if(msg_client):
@@ -158,7 +163,7 @@ def authenticate(connection):
             else: 
                 connection.close()
                 break
-        print(f'Authentification: {authentified}')
+        print(f'[AUTHENTICATION] {authentified}')
         
 
 # check if message is sent by the server
@@ -168,20 +173,20 @@ def check_for_new_message(connection):
         msg_type, msg_length, msg_content = message_peeling(msg_client)
         if msg_type == MessageType.DISCONNECT.value:
             print(f'[MSG] Message of length {msg_length} received: {msg_content}')
-            print('[RELEASING] Closing connection...')
+            print('\n[RELEASING] Closing connection...')
             connection.close()
             break
         if msg_type == MessageType.AES.value:
             msg_decrypted = aes_management_decrypt(msg_content)
             print(f'[MSG] Message of length {msg_length} received: {msg_decrypted}')
-            print('[AES] Sending AES encrypted message...')
+            print('\n[AES] Sending AES encrypted message...')
             connection.send(message_forming(aes_management_encrypt(MESSAGES['AES']), MessageType.AES.value))
     print('[SHUTDOWN] Server shutdown...')
 
 
 # key derivation
 def derivate_key():
-    print('[KEY] Key derivation...')
+    print('\n[KEY] Key derivation...')
     kc = bcrypt.kdf(password=KI.encode(),salt=load_credentials()['Rand'].encode(),desired_key_bytes=int(KEY_SIZE/8),rounds=128)
     update_credentials('Kc', bin(int(kc.hex(), 16))[2:].zfill(KEY_SIZE))
 
@@ -205,7 +210,7 @@ def client_handler(connection, address):
 # start server
 def start(server):
     server.listen()
-    print(f'[LISTENING] Server is listening on {SERVER}...')
+    print(f'\n[LISTENING] Server is listening on {SERVER}...')
 
     try:
         # while True:   #to use for multiple client connections
